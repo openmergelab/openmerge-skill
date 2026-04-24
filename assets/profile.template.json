@@ -1,0 +1,41 @@
+{
+  "version": 1,
+
+  "firstName": "",
+  "age": null,
+  "tagline": "",
+  "bio": "",
+
+  "interests": [],
+  "hobbies": [],
+  "values": [],
+  "personalityTags": [],
+
+  "lifestyle": {
+    "drinking": "prefer_not_say",
+    "smoking": "prefer_not_say",
+    "exercise": "sometimes",
+    "pets": "neutral",
+    "kids": "prefer_not_say",
+    "diet": "prefer_not_say"
+  },
+
+  "lookingFor": "unsure",
+
+  "discordHandle": "",
+  "discordId": "",
+
+  "seeking": "any",
+  "ageRange": [18, 99],
+  "locationH3": "",
+
+  "ageVerified": false,
+  "verifiedAt": null,
+  "verificationProvider": null,
+
+  "pushToken": null,
+
+  "setupComplete": false,
+  "createdAt": null,
+  "updatedAt": null
+}
