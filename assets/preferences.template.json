@@ -1,23 +1,18 @@
 {
   "version": 1,
-
   "values": [],
   "dealbreakers": [],
   "communicationStyle": "",
   "lookingForVibe": "",
   "vibeNotes": "",
-
   "interestWeights": {},
-
   "lifestyleDealbreakers": {
     "smoking": false,
     "kids": false,
     "drinking": false,
     "diet": []
   },
-
   "preferredPersonality": [],
   "avoidPersonality": [],
-
   "updatedAt": null
 }

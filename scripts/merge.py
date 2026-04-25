@@ -3,6 +3,7 @@
 # dependencies = [
 #   "cryptography>=41.0",
 #   "requests>=2.28",
+#   "h3>=4.0",
 # ]
 # ///
 """Merge CLI — upload signal or check matches."""
@@ -14,9 +15,11 @@ import base64
 import hashlib
 import json
 import os
+import subprocess
 import struct
 import sys
 import threading
+import time
 import uuid
 import webbrowser
 from datetime import datetime, timezone
@@ -24,6 +27,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+import h3
 import requests
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
@@ -37,7 +41,9 @@ ALLOWED_SIGNAL_FIELDS = frozenset(
     {
         "anonymousId",
         "locationH3",
+        "gender",
         "seeking",
+        "age",
         "ageRange",
         "publicKey",
         "encryptedVector",
@@ -239,14 +245,46 @@ DISCORD_REDIRECT_PORT = 9876
 DISCORD_REDIRECT_URI = f"http://localhost:{DISCORD_REDIRECT_PORT}/callback"
 
 
+def _open_incognito(url: str) -> None:
+    """Open URL in an incognito/private window. Falls back to default browser."""
+    if sys.platform == "darwin":
+        # Try Chrome incognito
+        try:
+            subprocess.Popen(
+                ["open", "-na", "Google Chrome", "--args", "--incognito", url],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            return
+        except FileNotFoundError:
+            pass
+        # Try Firefox private
+        try:
+            subprocess.Popen(
+                ["open", "-na", "Firefox", "--args", "-private-window", url],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            return
+        except FileNotFoundError:
+            pass
+    # Fallback: default browser (no incognito)
+    webbrowser.open(url)
+
+
 class _OAuthCallbackHandler(BaseHTTPRequestHandler):
     """Handles the OAuth redirect, extracts the authorization code."""
 
     code: str | None = None
+    error: str | None = None
+    error_description: str | None = None
 
     def do_GET(self) -> None:
         qs = parse_qs(urlparse(self.path).query)
         code = qs.get("code", [None])[0]
+        error = qs.get("error", [None])[0]
+        error_desc = qs.get("error_description", [None])[0]
+
         if code:
             _OAuthCallbackHandler.code = code
             self.send_response(200)
@@ -254,6 +292,17 @@ class _OAuthCallbackHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(
                 b"<html><body><h2>Done &#8212; you can close this tab.</h2></body></html>"
+            )
+        elif error:
+            _OAuthCallbackHandler.error = error
+            _OAuthCallbackHandler.error_description = error_desc
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            msg = error_desc or error
+            self.wfile.write(
+                f"<html><body><h2>Login failed: {msg}</h2>"
+                f"<p>You can close this tab.</p></body></html>".encode()
             )
         else:
             self.send_response(400)
@@ -293,12 +342,26 @@ def _exchange_code_via_broker(code: str, broker_url: str) -> dict:
     return {}  # unreachable
 
 
+def _mark_age_unverified(profile_path: str) -> None:
+    """Record that Discord age verification was not completed."""
+    p = Path(profile_path)
+    profile = json.loads(p.read_text(encoding="utf-8"))
+    profile["ageVerified"] = False
+    profile["verificationProvider"] = "discord"
+    profile["updatedAt"] = datetime.now(timezone.utc).isoformat()
+    p.write_text(json.dumps(profile, indent=2) + "\n", encoding="utf-8")
+    log(f"Marked age unverified in {p.name}")
+
+
 def _update_profile_discord(profile_path: str, discord_id: str, discord_handle: str) -> None:
     """Write discordId and discordHandle into profile.json."""
     p = Path(profile_path)
     profile = json.loads(p.read_text(encoding="utf-8"))
     profile["discordId"] = discord_id
     profile["discordHandle"] = discord_handle
+    profile["ageVerified"] = True
+    profile["verifiedAt"] = datetime.now(timezone.utc).isoformat()
+    profile["verificationProvider"] = "discord"
     profile["updatedAt"] = datetime.now(timezone.utc).isoformat()
     p.write_text(json.dumps(profile, indent=2) + "\n", encoding="utf-8")
     log(f"Updated {p.name} with Discord identity")
@@ -321,11 +384,28 @@ def build_signal_payload(
     raw_seeking = profile.get("seeking", "any")
     seeking = _seeking_map.get(raw_seeking.lower(), raw_seeking)
 
+    # Normalize gender: profile uses "Woman", "Man", "Non-binary"
+    _gender_map = {"woman": "F", "man": "M", "non-binary": "NB", "male": "M", "female": "F", "nonbinary": "NB"}
+    raw_gender = profile.get("gender")
+    if raw_gender is None:
+        raise RuntimeError("Profile must include 'gender' for signal upload")
+    gender = _gender_map.get(raw_gender.lower(), raw_gender)
+
     age_range = profile.get("ageRange", [18, 99])
+    user_age = profile.get("age")
+    if user_age is None:
+        raise RuntimeError("Profile must include 'age' for signal upload")
+    # Broker requires resolution 9; profile may store coarser resolution
+    raw_h3 = profile["locationH3"]
+    if h3.get_resolution(raw_h3) != 9:
+        raw_h3 = h3.cell_to_center_child(raw_h3, 9)
+
     payload = {
         "anonymousId": anonymous_id,
-        "locationH3": profile["locationH3"],
+        "locationH3": raw_h3,
+        "gender": gender,
         "seeking": seeking,
+        "age": int(user_age),
         "ageRange": {"min": age_range[0], "max": age_range[1]},
         "publicKey": hashlib.sha256(key).hexdigest(),
         "encryptedVector": encrypted_b64,
@@ -395,7 +475,16 @@ def upload_signal(payload: dict, token: str, broker_url: str) -> dict:
         output_error("Authentication failed — re-authenticate first", 2)
     if resp.status_code == 429:
         output_error("Too many requests — try again later", 4)
-    output_error(f"Broker error ({resp.status_code}) — try again later", 4)
+    try:
+        body = resp.json()
+        detail = body.get("message", "") or body.get("error", "")
+        fields = body.get("fields", [])
+        msg = f"Broker error ({resp.status_code}): {detail}"
+        if fields:
+            msg += f" — fields: {', '.join(fields)}"
+    except Exception:
+        msg = f"Broker error ({resp.status_code}) — try again later"
+    output_error(msg, 4)
     return {}  # unreachable
 
 
@@ -407,6 +496,56 @@ def fetch_matches(token: str, broker_url: str) -> dict:
     try:
         log(f"GET {url}")
         resp = requests.get(url, headers=headers, timeout=(5, 10))
+    except requests.ConnectionError:
+        output_error("Cannot reach broker — check your connection", 3)
+    except requests.Timeout:
+        output_error("Cannot reach broker — connection timed out", 3)
+    except requests.RequestException as exc:
+        output_error(f"Cannot reach broker — {exc}", 3)
+
+    if resp.status_code == 200:
+        return resp.json()
+    if resp.status_code == 401:
+        output_error("Authentication failed — re-authenticate first", 2)
+    if resp.status_code == 429:
+        output_error("Too many requests — try again later", 4)
+    output_error(f"Broker error ({resp.status_code}) — try again later", 4)
+    return {}  # unreachable
+
+
+def delete_signal(token: str, broker_url: str) -> dict:
+    """DELETE /signal from broker.  Removes the user's active signal."""
+    headers = {"Authorization": f"Bearer {token}"}
+    url = f"{broker_url.rstrip('/')}/signal"
+
+    try:
+        log(f"DELETE {url}")
+        resp = requests.delete(url, headers=headers, timeout=(5, 10))
+    except requests.ConnectionError:
+        output_error("Cannot reach broker — check your connection", 3)
+    except requests.Timeout:
+        output_error("Cannot reach broker — connection timed out", 3)
+    except requests.RequestException as exc:
+        output_error(f"Cannot reach broker — {exc}", 3)
+
+    if resp.status_code == 200:
+        return resp.json()
+    if resp.status_code == 401:
+        output_error("Authentication failed — re-authenticate first", 2)
+    if resp.status_code == 429:
+        output_error("Too many requests — try again later", 4)
+    output_error(f"Broker error ({resp.status_code}) — try again later", 4)
+    return {}  # unreachable
+
+
+def delete_account(token: str, broker_url: str) -> dict:
+    """DELETE /account from broker.  Removes the user's account entirely."""
+    headers = {"Authorization": f"Bearer {token}"}
+    url = f"{broker_url.rstrip('/')}/account"
+
+    try:
+        log(f"DELETE {url}")
+        resp = requests.delete(url, headers=headers, timeout=(5, 10))
     except requests.ConnectionError:
         output_error("Cannot reach broker — check your connection", 3)
     except requests.Timeout:
@@ -499,6 +638,12 @@ def build_parser() -> argparse.ArgumentParser:
     # matches subcommand
     sub.add_parser("matches", help="Fetch current matches from broker")
 
+    # pause subcommand
+    sub.add_parser("pause", help="Remove signal and pause matching")
+
+    # delete subcommand
+    sub.add_parser("delete", help="Delete account and all local data")
+
     # auth subcommand (Discord OAuth → broker session in one step)
     auth_p = sub.add_parser("auth", help="Authenticate via Discord OAuth")
     auth_p.add_argument(
@@ -565,9 +710,40 @@ def cmd_matches(args: argparse.Namespace) -> None:
         }
     )
 
+def cmd_pause(args: argparse.Namespace) -> None:
+    """Pause subcommand: remove signal from broker."""
+    token = get_session_token()
+    log("Removing signal\u2026")
+    delete_signal(token, args.broker_url)
+
+    # Remove local signal record
+    signal_path = Path("assets/signal.json")
+    if signal_path.exists():
+        signal_path.unlink()
+        log("Removed local signal record")
+
+    output_success({"removed": True})
+
+
+def cmd_delete(args: argparse.Namespace) -> None:
+    """Delete subcommand: remove broker account and local files."""
+    token = get_session_token()
+    log("Deleting account\u2026")
+    delete_account(token, args.broker_url)
+
+    # Remove local files
+    for f in ["assets/profile.json", "assets/preferences.json", "assets/signal.json",
+              ".merge_session", "merge_key.bin", "anonymous_id"]:
+        p = Path(f)
+        if p.exists():
+            p.unlink()
+            log(f"Removed {f}")
+
+    output_success({"deleted": True})
+
 
 def cmd_auth(args: argparse.Namespace) -> None:
-    """Auth subcommand: Discord OAuth via broker (secret stays server-side)."""
+    """Auth subcommand: Discord OAuth via broker."""
     client_id = args.client_id
 
     if not client_id:
@@ -575,8 +751,19 @@ def cmd_auth(args: argparse.Namespace) -> None:
 
     # Start local callback server
     _OAuthCallbackHandler.code = None
+    _OAuthCallbackHandler.error = None
+    _OAuthCallbackHandler.error_description = None
     server = HTTPServer(("localhost", DISCORD_REDIRECT_PORT), _OAuthCallbackHandler)
-    server_thread = threading.Thread(target=server.handle_request, daemon=True)
+    server.timeout = 2  # handle_request returns every 2 s so we can check
+
+    def _serve_until_done(timeout_secs: int = 120) -> None:
+        deadline = time.monotonic() + timeout_secs
+        while time.monotonic() < deadline:
+            server.handle_request()
+            if _OAuthCallbackHandler.code or _OAuthCallbackHandler.error:
+                return
+
+    server_thread = threading.Thread(target=_serve_until_done, daemon=True)
     server_thread.start()
 
     # Open browser to Discord authorize URL
@@ -585,18 +772,26 @@ def cmd_auth(args: argparse.Namespace) -> None:
         f"?client_id={client_id}"
         f"&redirect_uri={DISCORD_REDIRECT_URI}"
         f"&response_type=code"
-        f"&scope=identify%20guilds.join"
+        f"&scope=identify"
     )
     log("Opening browser for Discord login…")
-    webbrowser.open(auth_url)
+    log(f"Auth URL: {auth_url}")
+    _open_incognito(auth_url)
 
-    # Wait for callback
-    server_thread.join(timeout=120)
+    # Wait for callback (server thread exits on code, error, or 120 s timeout)
+    server_thread.join(timeout=125)
     server.server_close()
+
+    # Check for OAuth error (e.g. age verification, access_denied)
+    if _OAuthCallbackHandler.error:
+        desc = _OAuthCallbackHandler.error_description or _OAuthCallbackHandler.error
+        _mark_age_unverified(args.profile)
+        output_error(f"Discord denied login: {desc}", 2)
 
     code = _OAuthCallbackHandler.code
     if not code:
-        output_error("Discord login timed out or was cancelled", 2)
+        _mark_age_unverified(args.profile)
+        output_error("Discord login timed out — complete the login in your browser within 30 seconds", 2)
 
     # Send code to broker — broker exchanges it server-side (holds the secret)
     log("Sending authorization code to broker…")
@@ -645,6 +840,10 @@ def main() -> None:
         cmd_matches(args)
     elif args.command == "auth":
         cmd_auth(args)
+    elif args.command == "pause":
+        cmd_pause(args)
+    elif args.command == "delete":
+        cmd_delete(args)
     else:
         parser.print_help()
         sys.exit(1)
