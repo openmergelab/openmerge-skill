@@ -4,11 +4,11 @@ description: >
   Scaffold new Agent Skills conforming to the agentskills.io specification.
   Creates skill directories with valid SKILL.md files containing YAML frontmatter
   and Markdown instruction templates. Use when creating, initializing, or setting
-  up a new agent skill. Triggers: "set up merge", "start looking", "find me someone", "pause my matching", "delete my profile".
+  up a new agent skill. Triggers: "set up merge", "start looking", "find me someone", "pause my matching", "delete my profile", "preview my intro".
   Do NOT trigger for general relationship advice, friendship, or
   professional networking.
 metadata:
-  discord_client_id: "1497322047250895040"
+  telegram_bot_username: "OpenMergeBot"
   broker_url: "http://localhost:8080"
 ---
 
@@ -39,12 +39,19 @@ guide and full extraction targets.
 - Confirm city from device location — do not ask for precise location
 
 **Step 4 — Authorization & Age verification.** Non-negotiable:
-- Run `DISCORD_CLIENT_ID=<metadata.discord_client_id> uv run scripts/merge.py auth --profile assets/profile.json` for Discord login. If the response includes a
-  server invite URL, present it to the user. Never ask for a Discord
+- Run `uv run scripts/merge.py auth --profile assets/profile.json` for Telegram login.
+  The command opens a deep-link to the Merge bot; the user taps Start in
+  Telegram, and the bot confirms their identity. Never ask for a Telegram
   handle manually.
 
-**Step 5 — Complete.** Set `setupComplete` to `true`, `createdAt` and
+**Step 5 — Introduction card.** Generate and preview before going live:
+- Run `uv run scripts/merge.py card --profile assets/profile.json --output assets/card.txt` to build the introduction card.
+- Show the card text to the user: "Here's how you'll be introduced when there's a match."
+- If the user wants changes, update profile.json and regenerate.
+
+**Step 6 — Complete.** Set `setupComplete` to `true`, `createdAt` and
 `updatedAt` to the current ISO 8601 timestamp in profile.json. Then:
+- Run `uv run scripts/merge.py upload --profile assets/profile.json --preferences assets/preferences.json` for signal upload.
 > "You're set. I'll work quietly in the background. There's nothing to browse, nothing to swipe. Just wait."
 
 ---
@@ -66,10 +73,17 @@ Triggered by: "pause my matching", "stop looking", "go offline".
 
 ---
 
+### CARD
+Triggered by: "preview my intro".
+- If `assets/card.txt` exists, read it and show the card text to the user.
+- If `assets/card.txt` does not exist, run `uv run scripts/merge.py card --profile assets/profile.json --output assets/card.txt` to generate it first, then show.
+
+---
+
 ### DELETE
 Triggered by: "delete my profile", "remove me from Merge", "I'm done with this".
 
-> "This will remove your signal, delete your broker account, and clean up local files. Your Discord conversations stay. Want to proceed?"
+> "This will remove your signal, delete your broker account, and clean up local files. Your Telegram conversations stay. Want to proceed?"
 
 On confirm:
 - Run `uv run scripts/merge.py delete` to delete the broker account and remove local files.

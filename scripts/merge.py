@@ -15,17 +15,14 @@ import base64
 import hashlib
 import json
 import os
-import subprocess
 import struct
 import sys
-import threading
 import time
 import uuid
 import webbrowser
 from datetime import datetime, timezone
-from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import urlencode
 
 import h3
 import requests
@@ -47,7 +44,7 @@ ALLOWED_SIGNAL_FIELDS = frozenset(
         "ageRange",
         "publicKey",
         "encryptedVector",
-        "discordIdHash",
+        "telegramIdHash",
         "pushToken",
     }
 )
@@ -123,8 +120,8 @@ def validate_profile(profile: dict) -> None:
         output_error("Setup incomplete — finish onboarding first", 1)
     if not profile.get("locationH3"):
         output_error("Location required — set your location first", 1)
-    if not profile.get("discordId"):
-        output_error("Discord ID required — link your Discord account", 1)
+    if not profile.get("telegramId"):
+        output_error("Telegram ID required — link your Telegram account", 1)
 
 
 # ---------------------------------------------------------------------------
@@ -226,145 +223,46 @@ def encrypt_vector(key: bytes, vector_bytes: bytes) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Discord ID hash  (T012)
+# Telegram ID hash  (T012)
 # ---------------------------------------------------------------------------
 
 
-def hash_discord_id(discord_id: str) -> str:
-    """SHA-256 hash of Discord ID, returned as 64-char hex string."""
-    return hashlib.sha256(discord_id.encode("utf-8")).hexdigest()
+def hash_telegram_id(telegram_id: str) -> str:
+    """SHA-256 hash of Telegram ID, returned as 64-char hex string."""
+    return hashlib.sha256(str(telegram_id).encode("utf-8")).hexdigest()
 
 
 # ---------------------------------------------------------------------------
-# Discord OAuth  (auth)
+# Telegram bot deep-link auth
 # ---------------------------------------------------------------------------
 
-DISCORD_OAUTH_BASE = "https://discord.com/api/v10"
-DISCORD_OAUTH_AUTHORIZE = "https://discord.com/oauth2/authorize"
-DISCORD_REDIRECT_PORT = 9876
-DISCORD_REDIRECT_URI = f"http://localhost:{DISCORD_REDIRECT_PORT}/callback"
-
-
-def _open_incognito(url: str) -> None:
-    """Open URL in an incognito/private window. Falls back to default browser."""
-    if sys.platform == "darwin":
-        # Try Chrome incognito
-        try:
-            subprocess.Popen(
-                ["open", "-na", "Google Chrome", "--args", "--incognito", url],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            return
-        except FileNotFoundError:
-            pass
-        # Try Firefox private
-        try:
-            subprocess.Popen(
-                ["open", "-na", "Firefox", "--args", "-private-window", url],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            return
-        except FileNotFoundError:
-            pass
-    # Fallback: default browser (no incognito)
-    webbrowser.open(url)
-
-
-class _OAuthCallbackHandler(BaseHTTPRequestHandler):
-    """Handles the OAuth redirect, extracts the authorization code."""
-
-    code: str | None = None
-    error: str | None = None
-    error_description: str | None = None
-
-    def do_GET(self) -> None:
-        qs = parse_qs(urlparse(self.path).query)
-        code = qs.get("code", [None])[0]
-        error = qs.get("error", [None])[0]
-        error_desc = qs.get("error_description", [None])[0]
-
-        if code:
-            _OAuthCallbackHandler.code = code
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html")
-            self.end_headers()
-            self.wfile.write(
-                b"<html><body><h2>Done &#8212; you can close this tab.</h2></body></html>"
-            )
-        elif error:
-            _OAuthCallbackHandler.error = error
-            _OAuthCallbackHandler.error_description = error_desc
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html")
-            self.end_headers()
-            msg = error_desc or error
-            self.wfile.write(
-                f"<html><body><h2>Login failed: {msg}</h2>"
-                f"<p>You can close this tab.</p></body></html>".encode()
-            )
-        else:
-            self.send_response(400)
-            self.send_header("Content-Type", "text/html")
-            self.end_headers()
-            self.wfile.write(b"<html><body><h2>Error: no code received.</h2></body></html>")
-
-    def log_message(self, format: str, *args: object) -> None:  # noqa: A002
-        pass  # silence request logs
-
-
-def _exchange_code_via_broker(code: str, broker_url: str) -> dict:
-    """Send OAuth code to broker for server-side exchange. Secret never leaves the broker."""
-    url = f"{broker_url.rstrip('/')}/auth/discord"
-    try:
-        log(f"POST {url}")
-        resp = requests.post(
-            url,
-            json={"code": code, "redirectUri": DISCORD_REDIRECT_URI},
-            headers={"Content-Type": "application/json"},
-            timeout=(5, 15),
-        )
-    except requests.ConnectionError:
-        output_error("Cannot reach broker — check your connection", 3)
-    except requests.Timeout:
-        output_error("Cannot reach broker — connection timed out", 3)
-    except requests.RequestException as exc:
-        output_error(f"Cannot reach broker — {exc}", 3)
-
-    if resp.status_code == 200:
-        return resp.json()
-    if resp.status_code == 503:
-        output_error("Discord OAuth not configured on the broker", 3)
-    if resp.status_code == 502:
-        output_error("Broker could not reach Discord — try again", 3)
-    output_error(f"Broker error ({resp.status_code}) — try again later", 4)
-    return {}  # unreachable
+TELEGRAM_BOT_API = "https://api.telegram.org"
+TELEGRAM_AUTH_URL = "https://oauth.telegram.org/auth"
 
 
 def _mark_age_unverified(profile_path: str) -> None:
-    """Record that Discord age verification was not completed."""
+    """Record that Telegram age verification was not completed."""
     p = Path(profile_path)
     profile = json.loads(p.read_text(encoding="utf-8"))
     profile["ageVerified"] = False
-    profile["verificationProvider"] = "discord"
+    profile["verificationProvider"] = "telegram"
     profile["updatedAt"] = datetime.now(timezone.utc).isoformat()
     p.write_text(json.dumps(profile, indent=2) + "\n", encoding="utf-8")
     log(f"Marked age unverified in {p.name}")
 
 
-def _update_profile_discord(profile_path: str, discord_id: str, discord_handle: str) -> None:
-    """Write discordId and discordHandle into profile.json."""
+def _update_profile_telegram(profile_path: str, telegram_id: str, telegram_handle: str) -> None:
+    """Write telegramId and telegramHandle into profile.json."""
     p = Path(profile_path)
     profile = json.loads(p.read_text(encoding="utf-8"))
-    profile["discordId"] = discord_id
-    profile["discordHandle"] = discord_handle
+    profile["telegramId"] = telegram_id
+    profile["telegramHandle"] = telegram_handle
     profile["ageVerified"] = True
     profile["verifiedAt"] = datetime.now(timezone.utc).isoformat()
-    profile["verificationProvider"] = "discord"
+    profile["verificationProvider"] = "telegram"
     profile["updatedAt"] = datetime.now(timezone.utc).isoformat()
     p.write_text(json.dumps(profile, indent=2) + "\n", encoding="utf-8")
-    log(f"Updated {p.name} with Discord identity")
+    log(f"Updated {p.name} with Telegram identity")
 
 
 # ---------------------------------------------------------------------------
@@ -380,7 +278,7 @@ def build_signal_payload(
 ) -> dict:
     """Construct anonymous signal payload — only allowed fields."""
     # Normalize seeking: profile may use long-form ("male", "female", "nonbinary")
-    _seeking_map = {"male": "M", "female": "F", "nonbinary": "NB", "non-binary": "NB"}
+    _seeking_map = {"male": "M", "female": "F", "nonbinary": "NB", "non-binary": "NB", "woman": "F", "man": "M", "women": "F", "men": "M"}
     raw_seeking = profile.get("seeking", "any")
     seeking = _seeking_map.get(raw_seeking.lower(), raw_seeking)
 
@@ -409,7 +307,7 @@ def build_signal_payload(
         "ageRange": {"min": age_range[0], "max": age_range[1]},
         "publicKey": hashlib.sha256(key).hexdigest(),
         "encryptedVector": encrypted_b64,
-        "discordIdHash": hash_discord_id(profile["discordId"]),
+        "telegramIdHash": hash_telegram_id(profile["telegramId"]),
         "pushToken": profile.get("pushToken"),
     }
     # T017 — privacy allowlist enforcement
@@ -641,11 +539,24 @@ def build_parser() -> argparse.ArgumentParser:
     # pause subcommand
     sub.add_parser("pause", help="Remove signal and pause matching")
 
+    # card subcommand
+    card_p = sub.add_parser("card", help="Build introduction card from local profile")
+    card_p.add_argument(
+        "--profile",
+        default="assets/profile.json",
+        help="Path to profile JSON (default: assets/profile.json)",
+    )
+    card_p.add_argument(
+        "--output",
+        default="assets/card.txt",
+        help="Path to write card file (default: assets/card.txt)",
+    )
+
     # delete subcommand
     sub.add_parser("delete", help="Delete account and all local data")
 
-    # auth subcommand (Discord OAuth → broker session in one step)
-    auth_p = sub.add_parser("auth", help="Authenticate via Discord OAuth")
+    # auth subcommand (Telegram OIDC → broker session in one step)
+    auth_p = sub.add_parser("auth", help="Authenticate via Telegram OIDC")
     auth_p.add_argument(
         "--profile",
         default="assets/profile.json",
@@ -653,8 +564,33 @@ def build_parser() -> argparse.ArgumentParser:
     )
     auth_p.add_argument(
         "--client-id",
-        default=os.environ.get("DISCORD_CLIENT_ID", ""),
-        help="Discord OAuth client ID (default: DISCORD_CLIENT_ID env var)",
+        default=os.environ.get("TELEGRAM_CLIENT_ID", "8667905487"),
+        help="Telegram OIDC client ID (default: TELEGRAM_CLIENT_ID env var)",
+    )
+    auth_p.add_argument(
+        "--dev",
+        action="store_true",
+        default=False,
+        help="Dev mode: skip OIDC browser flow, create session via /auth/session",
+    )
+    auth_p.add_argument(
+        "--telegram-id",
+        default=os.environ.get("TELEGRAM_ID", ""),
+        help="Telegram user ID for --dev mode (default: TELEGRAM_ID env var)",
+    )
+    auth_p.add_argument(
+        "--telegram-handle",
+        default=os.environ.get("TELEGRAM_HANDLE", ""),
+        help="Telegram username for --dev mode (default: TELEGRAM_HANDLE env var)",
+    )
+    auth_p.add_argument(
+        "--redirect-url",
+        default=os.environ.get("MERGE_REDIRECT_URL", ""),
+        help=(
+            "Public redirect URL for OAuth callback (e.g. from cloudflared tunnel). "
+            "The local server still listens on localhost; the tunnel forwards traffic. "
+            "(default: MERGE_REDIRECT_URL env var, or http://localhost:<port>/callback)"
+        ),
     )
 
     return parser
@@ -725,6 +661,58 @@ def cmd_pause(args: argparse.Namespace) -> None:
     output_success({"removed": True})
 
 
+def cmd_card(args: argparse.Namespace) -> None:
+    """Card subcommand: build introduction card from local profile."""
+    profile_path = Path(args.profile)
+    if not profile_path.exists():
+        output_error("No profile found. Run setup first.", 1)
+
+    profile = json.loads(profile_path.read_text(encoding="utf-8"))
+
+    # Pick the most interesting signals
+    highlights: list[str] = []
+    hobbies = profile.get("hobbies", [])
+    interests = profile.get("interests", [])
+
+    if hobbies:
+        highlights.append(hobbies[0])
+    elif interests:
+        highlights.append(interests[0])
+
+    if interests and len(highlights) < 2:
+        # avoid duplicating if hobby == first interest
+        candidate = interests[0]
+        if candidate not in highlights:
+            highlights.append(candidate)
+
+    # Intent line
+    looking_for = profile.get("lookingFor", "unsure")
+    if looking_for == "relationship":
+        intent = "looking for something real"
+    elif looking_for == "dating":
+        intent = "seeing where things go"
+    else:
+        intent = "figuring it out"
+
+    highlight_str = (', '.join(highlights) + ', ') if highlights else ''
+    first_name = profile.get("firstName", "") or "Anonymous"
+    age = profile.get("age", "?")
+    first_line = f"{first_name}, {age} \u2014 {highlight_str}{intent}."
+
+    tagline = profile.get("tagline", "")
+    second_line = f'\u201c{tagline}\u201d' if tagline else ""
+
+    card = "\n".join(line for line in [first_line, second_line] if line)
+
+    # Write card file
+    card_path = Path(args.output)
+    card_path.parent.mkdir(parents=True, exist_ok=True)
+    card_path.write_text(card, encoding="utf-8")
+    log(f"Card written to {card_path}")
+
+    output_success({"card": card})
+
+
 def cmd_delete(args: argparse.Namespace) -> None:
     """Delete subcommand: remove broker account and local files."""
     token = get_session_token()
@@ -743,69 +731,132 @@ def cmd_delete(args: argparse.Namespace) -> None:
 
 
 def cmd_auth(args: argparse.Namespace) -> None:
-    """Auth subcommand: Discord OAuth via broker."""
-    client_id = args.client_id
+    """Auth subcommand: Telegram OIDC Authorization Code Flow with PKCE."""
 
-    if not client_id:
-        output_error("Discord client ID required — set DISCORD_CLIENT_ID or use --client-id", 1)
+    # --- Dev bypass: skip OIDC, create session directly via /auth/session ---
+    if getattr(args, "dev", False):
+        telegram_id = args.telegram_id
+        telegram_handle = args.telegram_handle
+        if not telegram_id:
+            output_error("--telegram-id required in dev mode (or set TELEGRAM_ID env)", 1)
 
-    # Start local callback server
-    _OAuthCallbackHandler.code = None
-    _OAuthCallbackHandler.error = None
-    _OAuthCallbackHandler.error_description = None
-    server = HTTPServer(("localhost", DISCORD_REDIRECT_PORT), _OAuthCallbackHandler)
-    server.timeout = 2  # handle_request returns every 2 s so we can check
+        anonymous_id = get_or_create_anonymous_id()
+        telegram_id_hash = hash_telegram_id(telegram_id)
 
-    def _serve_until_done(timeout_secs: int = 120) -> None:
-        deadline = time.monotonic() + timeout_secs
-        while time.monotonic() < deadline:
-            server.handle_request()
-            if _OAuthCallbackHandler.code or _OAuthCallbackHandler.error:
-                return
+        log(f"Dev mode: creating session for telegram_id={telegram_id}")
+        url = f"{args.broker_url.rstrip('/')}/auth/session"
+        try:
+            resp = requests.post(
+                url,
+                json={"anonymousId": anonymous_id, "telegramIdHash": telegram_id_hash},
+                headers={"Content-Type": "application/json"},
+                timeout=(5, 15),
+            )
+        except requests.RequestException as exc:
+            output_error(f"Cannot reach broker — {exc}", 3)
 
-    server_thread = threading.Thread(target=_serve_until_done, daemon=True)
-    server_thread.start()
+        if resp.status_code != 200:
+            try:
+                msg = resp.json().get("message", resp.text)
+            except Exception:
+                msg = resp.text
+            output_error(f"Broker error ({resp.status_code}): {msg}", 4)
 
-    # Open browser to Discord authorize URL
-    auth_url = (
-        f"{DISCORD_OAUTH_AUTHORIZE}"
-        f"?client_id={client_id}"
-        f"&redirect_uri={DISCORD_REDIRECT_URI}"
-        f"&response_type=code"
-        f"&scope=identify"
-    )
-    log("Opening browser for Discord login…")
+        data = resp.json()
+        token = data.get("token", "")
+        resolved_id = data.get("anonymousId", anonymous_id)
+
+        # Update profile with telegram identity
+        _update_profile_telegram(args.profile, telegram_id, telegram_handle)
+
+        # Save session token
+        if token:
+            session_path = Path(".merge_session")
+            session_path.write_text(token + "\n", encoding="utf-8")
+            os.chmod(session_path, 0o600)
+            log("Session token saved to .merge_session")
+
+        Path("anonymous_id").write_text(resolved_id, encoding="utf-8")
+
+        output_success({
+            "telegramId": telegram_id,
+            "telegramHandle": telegram_handle,
+            "anonymousId": resolved_id,
+        })
+        return
+
+    # --- Standard OIDC flow (broker-mediated with polling) ---
+    # The broker handles the Telegram redirect; the CLI just polls for the result.
+    broker_base = args.broker_url.rstrip("/")
+
+    # Step 1: Request auth session from broker
+    start_url = f"{broker_base}/auth/telegram/start"
+    try:
+        resp = requests.post(start_url, timeout=(5, 15))
+    except requests.RequestException as exc:
+        output_error(f"Cannot reach broker — {exc}", 3)
+
+    if resp.status_code != 200:
+        try:
+            msg = resp.json().get("message", resp.text)
+        except Exception:
+            msg = resp.text
+        output_error(f"Broker error ({resp.status_code}): {msg}", 3)
+
+    start_data = resp.json()
+    auth_url = start_data.get("authUrl", "")
+    state = start_data.get("state", "")
+    if not auth_url or not state:
+        output_error("Broker returned invalid auth start response", 3)
+
+    # Step 2: Open browser to Telegram auth
+    log("Opening Telegram authorization…")
     log(f"Auth URL: {auth_url}")
-    _open_incognito(auth_url)
+    webbrowser.open(auth_url)
 
-    # Wait for callback (server thread exits on code, error, or 120 s timeout)
-    server_thread.join(timeout=125)
-    server.server_close()
+    # Step 3: Poll broker for result
+    poll_url = f"{broker_base}/auth/telegram/poll?" + urlencode({"state": state})
+    log("Waiting for authorization (poll every 2s, timeout 2min)…")
+    deadline = time.monotonic() + 120
+    data = None
+    while time.monotonic() < deadline:
+        time.sleep(2)
+        try:
+            poll_resp = requests.get(poll_url, timeout=(5, 10))
+        except requests.RequestException:
+            continue  # transient error, retry
 
-    # Check for OAuth error (e.g. age verification, access_denied)
-    if _OAuthCallbackHandler.error:
-        desc = _OAuthCallbackHandler.error_description or _OAuthCallbackHandler.error
+        if poll_resp.status_code == 200:
+            poll_data = poll_resp.json()
+            status = poll_data.get("status", "")
+            if status == "complete":
+                data = poll_data
+                break
+            elif status == "error":
+                err_msg = poll_data.get("error", "unknown error")
+                _mark_age_unverified(args.profile)
+                output_error(f"Telegram login failed: {err_msg}", 2)
+            elif status == "expired":
+                _mark_age_unverified(args.profile)
+                output_error("Auth session expired — try again", 2)
+            # status == "pending" → continue polling
+        elif poll_resp.status_code in (404, 410):
+            _mark_age_unverified(args.profile)
+            output_error("Auth session expired or not found — try again", 2)
+
+    if data is None:
         _mark_age_unverified(args.profile)
-        output_error(f"Discord denied login: {desc}", 2)
+        output_error("Telegram login timed out — authorize within 2 minutes", 2)
 
-    code = _OAuthCallbackHandler.code
-    if not code:
-        _mark_age_unverified(args.profile)
-        output_error("Discord login timed out — complete the login in your browser within 30 seconds", 2)
-
-    # Send code to broker — broker exchanges it server-side (holds the secret)
-    log("Sending authorization code to broker…")
-    data = _exchange_code_via_broker(code, args.broker_url)
-
-    discord_id = data.get("discordId", "")
-    discord_handle = data.get("discordHandle", "")
-    if not discord_id:
-        output_error("Broker returned no Discord ID", 3)
+    telegram_id = data.get("telegramId", "")
+    telegram_handle = data.get("telegramHandle", "")
+    if not telegram_id:
+        output_error("Broker returned no Telegram ID", 3)
 
     # Update profile
-    _update_profile_discord(args.profile, discord_id, discord_handle)
+    _update_profile_telegram(args.profile, telegram_id, telegram_handle)
 
-    # Save session token from broker response
+    # Save session token
     token = data.get("token", "")
     if token:
         session_path = Path(".merge_session")
@@ -819,12 +870,10 @@ def cmd_auth(args: argparse.Namespace) -> None:
         Path("anonymous_id").write_text(resolved_id, encoding="utf-8")
 
     result: dict = {
-        "discordId": discord_id,
-        "discordHandle": discord_handle,
+        "telegramId": telegram_id,
+        "telegramHandle": telegram_handle,
         "anonymousId": resolved_id,
     }
-    if data.get("serverInvite"):
-        result["serverInvite"] = data["serverInvite"]
 
     output_success(result)
 
@@ -842,6 +891,8 @@ def main() -> None:
         cmd_auth(args)
     elif args.command == "pause":
         cmd_pause(args)
+    elif args.command == "card":
+        cmd_card(args)
     elif args.command == "delete":
         cmd_delete(args)
     else:
